@@ -1,0 +1,160 @@
+# Load packages.
+library(tidyverse)
+library(dplyr)
+library(lubridate)
+library(comorbidity)
+library(car)
+
+# Read dataset. Print dataset to ensure import correct. 
+claims <- read.csv('/Users/jonathanadams/Documents/US News World Report Data Analysis/USN_claims_test_data.csv')
+print(claims)
+
+# Import successful.
+
+# Task 1: Subset the dataset to the population at risk, admissions for patients undergoing 
+# isolated coronary artery bypass grafts (CABG), identified by procedure codes of 3610, 3611, 
+# 3612, 3613, 3614, 3615, 3616, 3617, or 3619.
+
+# Filter claims using dyplr 'filter' function.
+# Print to ensure correct import.
+# If/then statement produces errors, likely due to complexity of the operation.
+# Assign a record identifier to all claims.
+
+claims_records <- claims %>%
+  mutate(CABGPrep = 0) %>%
+  mutate(record = row_number())
+
+claims_subset_filter <- claims_records %>%
+  filter((procedure1 > 3609 & procedure1 < 3618 | procedure1 == 3619) |
+           (procedure2 > 3609 & procedure2 < 3618 | procedure2 == 3619) |
+           (procedure3 > 3609 & procedure3 < 3618 | procedure3 == 3619) |
+           (procedure4 > 3609 & procedure4 < 3618 | procedure4 == 3619) |
+           (procedure5 > 3609 & procedure5 < 3618 | procedure5 == 3619)) %>%
+  mutate(CABGPrep = 1)
+
+claims_CABG <- claims_records %>%
+  left_join(claims_subset_filter, by = 'record')
+
+claims_CABG$CABGPrep.y <- 
+  replace_na(claims_CABG$CABGPrep.y, 0)
+
+# Now need to clean the data frame.
+# Retain only the variables of interest.
+# Create new variable CABGPrep. 
+claims_CABG_clean <- claims_CABG %>%
+  select(patientId.x:CABGPrep.x, CABGPrep.y) %>%
+  mutate(CABG = CABGPrep.x + CABGPrep.y) %>%
+  select(-CABGPrep.x, -CABGPrep.y) %>%
+  rename_with(~str_remove(., '.x'))
+
+# I am now satisfied with claims_CABG_clean, so I will overwrite the claims data with it.
+
+claims <- claims_CABG_clean
+
+# Filter operation complete. 2,056 observations detected. 
+# Task 2: Identify comorbidities present in the diagnosis codes using either the Elixhauser (available
+# from AHRQ for SAS, or on SSC for Stata) or Charlson index (either is fine for this exercise).
+
+# Convert data from wide to long.
+# Rearrange data in order of patientID.
+claims_charlson_long <- gather(claims, diagnosis, icd9_code, diagnosis1:diagnosis5)
+arrange(claims_charlson_long, patientId)
+
+# Now calculate comorbidities.
+# Set assign0 = TRUE. This allows hierarchical coding of comorbidities.
+# Thus, if a patient has been diagnosed with both a disease that has later progressed, only the more
+# severe outcome will be included.
+
+claims_charlson <- comorbidity(x = claims_charlson_long, 
+                               id = 'patientId',
+                               code = 'icd9_code',
+                               map = 'charlson_icd9_quan',
+                               assign0 = TRUE)
+
+# The claims_charlson dataframe contains only one row per participant. 
+# Proceed with scoring Charlson scores.
+# Note to client that Charlson scores typically include age; however, I am omitting age
+# because Task 5 requires inclusion of age as covariate. Including age in the CCI
+# score could produce multicollinearity.
+
+charlson_score <- score(x = claims_charlson,
+                        weights = 'quan',
+                        assign0 = TRUE)
+
+# Bind the CCI scores to the dataset.
+claims_charlson <- cbind(claims_charlson, charlson_score)
+
+# Task 3: Identify whether each admission involved a readmission. A readmission here is defined as a
+# subsequent hospitalization for the same patientId within 30 days of the index admission.
+# Use a 'mutate' function to create a Boolean variable where 'TRUE' indicates rehospitalization.
+# Group by patientId.
+claims_readmit <- claims %>%
+  group_by(patientId) %>%
+  mutate(rehospitalized = dmy(admitDate) - lag(dmy(admitDate)) <= 30)
+
+claims_readmit$rehospitalized <- 
+  replace_na(claims_readmit$rehospitalized, FALSE)
+print(claims_readmit)
+
+calculated_vars <- 
+  left_join(claims, claims_readmit, by = 'patientId') %>%
+  left_join(claims_charlson, by = 'patientId') %>%
+  select(patientId, rehospitalized, charlson_score)
+
+# Transform the rehospitalized variable to an integer.
+calculated_vars$rehospitalized <- as.integer(calculated_vars$rehospitalized)
+print(calculated_vars)
+
+calculated_vars_max_hosp <- calculated_vars %>%
+  group_by(patientId) %>%
+  summarize(max_rehosp = max(rehospitalized)) %>%
+  left_join(calculated_vars, by = 'patientId') %>%
+  distinct(patientId, max_rehosp, charlson_score)
+
+# Task 4: Specify and run a regression model that estimates the likelihood of readmission among
+# patients admitted for CABG surgery. Control for age, systolic blood pressure, and the number of
+# comorbidities present in the admission record.
+
+# Take the predictor variables from the initial hospitalization. 
+claims_first <- claims %>%
+  group_by(patientId) %>%
+  arrange(dmy(admitDate)) %>%
+  mutate(visit_n = row_number()) %>%
+  ungroup() %>%
+  arrange(patientId) %>%
+  filter(visit_n == 1)
+
+# Create final dataset.
+analysis <- calculated_vars_max_hosp %>%
+  left_join(claims_first, by = 'patientId') %>%
+  distinct(patientId, max_rehosp, age, systolic, charlson_score, CABG) 
+
+# Perform logistic regression analysis.
+model <- glm(max_rehosp ~  CABG + age + systolic + charlson_score, 
+             data = analysis,
+             family = 'binomial')
+summary(model)
+exp(coef(model))
+exp(confint(model))
+print(model)
+
+# Assumptions of the model.
+# Check multicollinearity.
+cor(analysis$age, analysis$systolic, use = 'complete.obs')
+
+# Create histograms to ensure absence of outliers.
+hist(analysis$age)
+hist(analysis$systolic)
+hist(analysis$charlson_score)
+
+# Linear relationship between predictors and logit of the response variable.
+# We have to add 1 to the max_rehosp and CABG variables in order to perform the Box-Tidwell test, since there are some values that are below the minimum th
+analysisBT <- analysis %>%
+  mutate(max_rehosp = max_rehosp + 100) %>%
+  mutate(CABG = CABG + 100) %>%
+  mutate(charlson_score = charlson_score + 100) %>%
+  mutate(systolic = systolic + 100) %>%
+  mutate(age = age + 100)
+analysisBT <- na.omit(analysisBT)
+logodds <- model$linear.predictors
+boxTidwell(logodds ~ age + systolic + charlson_score, data = analysisBT)
